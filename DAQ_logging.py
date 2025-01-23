@@ -19,8 +19,13 @@ except ImportError:
 
 
 class DAQWorker(QtCore.QThread):
-    timesReady = QtCore.pyqtSignal(np.ndarray)  # shape=(n_samples,)
-    dataReady = QtCore.pyqtSignal(np.ndarray)   # shape=(n_channels, n_samples)
+    """
+    NI-DAQmxで連続サンプリング。
+    timesReady: shape=(n_samples,) (各サンプル時刻)
+    dataReady: shape=(n_channels, n_samples)
+    """
+    timesReady = QtCore.pyqtSignal(np.ndarray)
+    dataReady = QtCore.pyqtSignal(np.ndarray)
 
     def __init__(self, channels, sample_rate=1000, parent=None):
         super().__init__(parent)
@@ -45,21 +50,29 @@ class DAQWorker(QtCore.QThread):
 
         try:
             while self.is_running:
+                # 1回あたり 100サンプル取得
                 data = self.task.read(number_of_samples_per_channel=100, timeout=5.0)
                 data = np.array(data, dtype=np.float64)
+
+                # チャネル1つの場合は (1, n_samples) に reshape
                 if data.ndim == 1:
                     data = data.reshape((1, -1))
 
+                # サンプル数
                 actual_samples = data.shape[1]
+
+                # 今回のブロックの開始~終了時刻 (相対時間)
                 t_now = time.time() - self.start_time
                 t_start_block = t_now
                 t_end_block = t_now + (actual_samples - 1)/self.sample_rate
 
                 times = np.linspace(t_start_block, t_end_block, actual_samples)
 
+                # シグナル発行でメインスレッドへ
                 self.timesReady.emit(times)
                 self.dataReady.emit(data)
 
+                # CPU負荷軽減
                 time.sleep(0.01)
         finally:
             self.task.stop()
@@ -74,7 +87,7 @@ class DAQWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("DAQ Logging")
+        self.setWindowTitle("DAQ Logging - 20sec Display & Full Streaming Save")
 
         self.setFixedSize(1000, 1000)
 
@@ -149,17 +162,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_layout = QtWidgets.QVBoxLayout()
         self.plot_container.setLayout(self.plot_layout)
 
-        # プロット関係
+        # プロット関係(リングバッファ表示用)
         self.plot_widgets = []
         self.curves = []
         self.plot_times = []
         self.plot_data = []
 
-        # ★ 追加: ユーザが選択したチャンネル名を保持
         self.selected_channels = []
-
-        # スレッド
         self.daq_thread = None
+
+        # 逐次書き込み用の状態
+        self.file_path = None
+        self.file_format = None
+        self.file_opened = False
+        self.csv_header_written = False
+        self.h5file = None  # h5py.Fileオブジェクト
 
         # イベント
         self.start_button.clicked.connect(self.start_recording)
@@ -185,11 +202,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if dir_path:
             self.save_dir_lineedit.setText(dir_path)
 
+    # -------------- Start/Stop ------------------
     def start_recording(self):
         if self.daq_thread and self.daq_thread.is_running:
             return
 
-        # 前のプロットクリア
+        # プロットクリア
         self.clear_plots()
 
         selected_items = self.channel_list_widget.selectedItems()
@@ -200,10 +218,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sample_rate = float(self.sample_rate_lineedit.text())
 
-        # ★ 選択したチャネル名を保持
-        self.selected_channels = channels[:]  # コピー
+        # チャンネル名保持
+        self.selected_channels = channels[:]
 
-        # PlotWidget生成
+        # PlotWidget生成(リングバッファ表示用)
         for ch_idx, ch_name in enumerate(channels):
             plot_w = pg.PlotWidget()
             plot_w.setMinimumHeight(200)
@@ -215,19 +233,21 @@ class MainWindow(QtWidgets.QMainWindow):
             plot_w.setTitle(ch_name)
 
             curve = plot_w.plot(pen="cyan")
-            if ch_idx == 0:
-                pass
-            else:
+            if ch_idx > 0:
                 plot_w.setXLink(self.plot_widgets[0])
                 plot_w.setYLink(self.plot_widgets[0])
 
             self.plot_layout.addWidget(plot_w)
             self.plot_widgets.append(plot_w)
             self.curves.append(curve)
-
             self.plot_times.append(np.array([], dtype=np.float64))
             self.plot_data.append(np.array([], dtype=np.float64))
 
+        # ファイルをオープン(逐次書き込み)
+        if not self.open_file_for_writing():
+            return
+
+        # DAQ スレッド開始
         self.daq_thread = DAQWorker(channels=channels, sample_rate=sample_rate)
         self.daq_thread.timesReady.connect(self.on_times_ready)
         self.daq_thread.dataReady.connect(self.on_data_ready)
@@ -244,8 +264,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
-        # データ保存
-        self.save_data()
+        # 最後にファイルを閉じる
+        self.close_file()
+
+        QtWidgets.QMessageBox.information(self, "Info", "DAQ stopped and all data saved.")
 
     def clear_plots(self):
         while self.plot_widgets:
@@ -256,6 +278,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_times.clear()
         self.plot_data.clear()
 
+    # -------------- File Opening/Closing ------------------
+    def open_file_for_writing(self):
+        """
+        新規or追記のファイルを開いて、以後 on_data_ready() ごとに書き込む。
+        """
+        save_dir = self.save_dir_lineedit.text()
+        file_name = self.filename_lineedit.text().strip()
+        if not file_name:
+            file_name = "mydata"
+
+        if not save_dir or not os.path.isdir(save_dir):
+            QtWidgets.QMessageBox.warning(self, "Warning", "Invalid save directory.")
+            return False
+
+        self.file_format = self.format_combobox.currentText()  # "CSV" or "H5"
+        file_path = os.path.join(save_dir, file_name)
+        if self.file_format == "CSV":
+            if not file_path.lower().endswith(".csv"):
+                file_path += ".csv"
+            # CSV: ヘッダの有無だけ管理
+            self.csv_header_written = False
+
+            # appendモードで開く場合、ここでは不要(都度 open("a") でも可)
+            # ただし最初にファイルが存在したらどうするか等、要設計。
+            self.file_path = file_path
+            self.file_opened = True  # フラグだけ
+
+        else:
+            if not file_path.lower().endswith(".h5"):
+                file_path += ".h5"
+            self.file_path = file_path
+
+            # 新規作成("w") or 追記("r+")
+            # ここでは毎回新規作成する例
+            self.h5file = h5py.File(file_path, "w")
+            # timesとdataデータセットを可変長で用意
+            self.h5file.create_dataset("times", shape=(0,), maxshape=(None,), dtype=np.float64, chunks=(1024,))
+            self.h5file.create_dataset(
+                "data",
+                shape=(len(self.selected_channels), 0),
+                maxshape=(len(self.selected_channels), None),
+                dtype=np.float64,
+                chunks=(len(self.selected_channels), 1024)
+            )
+            # channel_names
+            dt = h5py.special_dtype(vlen=str)
+            ds = self.h5file.create_dataset("channel_names", (len(self.selected_channels),), dtype=dt)
+            for i, ch_name in enumerate(self.selected_channels):
+                ds[i] = ch_name
+            self.file_opened = True
+
+        return True
+
+    def close_file(self):
+        """ Stop時にファイルを閉じる """
+        if self.file_opened:
+            if self.file_format == "H5" and self.h5file is not None:
+                self.h5file.close()
+                self.h5file = None
+            self.file_opened = False
+
+    # -------------- DAQ -> GUI & File --------------
     def on_times_ready(self, times):
         self._current_times = times
 
@@ -269,6 +353,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(self.plot_times) != n_channels:
             return
 
+        # -------------------
+        # 1) リングバッファ: 直近20秒だけ表示
+        # -------------------
         max_hold_sec = 20.0
         t_latest = times_chunk[-1]
         t_threshold = t_latest - max_hold_sec
@@ -280,6 +367,58 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot_times[ch_i] = self.plot_times[ch_i][valid_mask]
             self.plot_data[ch_i] = self.plot_data[ch_i][valid_mask]
 
+        # -------------------
+        # 2) ファイルへのストリーミング保存
+        # -------------------
+        if self.file_opened:
+            if self.file_format == "CSV":
+                self.append_csv(times_chunk, data_chunk)
+            else:
+                self.append_hdf5(times_chunk, data_chunk)
+
+    # -------------- CSV Append --------------
+    def append_csv(self, times_chunk, data_chunk):
+        """
+        CSVに追記(append)する形で書き込む。
+        まだヘッダを書いていない場合は書く。
+        """
+        file_exists = os.path.isfile(self.file_path)
+        mode = "a"  # 追記モード
+        with open(self.file_path, mode, newline="") as f:
+            writer = csv.writer(f)
+            if (not self.csv_header_written) and (not file_exists):
+                # ヘッダ
+                header = ["time"] + list(self.selected_channels)
+                writer.writerow(header)
+                self.csv_header_written = True
+
+            n_channels, n_samps = data_chunk.shape
+            for i in range(n_samps):
+                row = [times_chunk[i]]
+                for ch_i in range(n_channels):
+                    row.append(data_chunk[ch_i, i])
+                writer.writerow(row)
+
+    # -------------- HDF5 Append (Resize) --------------
+    def append_hdf5(self, times_chunk, data_chunk):
+        if not self.h5file:
+            return
+        dset_times = self.h5file["times"]
+        dset_data  = self.h5file["data"]
+
+        old_size_t = dset_times.shape[0]
+        new_size_t = old_size_t + times_chunk.size
+        dset_times.resize((new_size_t,))
+        dset_times[old_size_t : new_size_t] = times_chunk
+
+        old_size_d = dset_data.shape[1]
+        new_size_d = old_size_d + data_chunk.shape[1]
+        dset_data.resize((len(self.selected_channels), new_size_d))
+        dset_data[:, old_size_d : new_size_d] = data_chunk
+
+        self.h5file.flush()
+
+    # -------------- Plot Update --------------
     def update_plots(self):
         if not self.curves:
             return
@@ -315,85 +454,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if ch_i < len(self.plot_widgets):
                 self.plot_widgets[ch_i].setXRange(0, time_scale, padding=0)
 
-    # ------------------ データ保存 -------------------
-    def save_data(self):
-        save_dir = self.save_dir_lineedit.text()
-        file_name = self.filename_lineedit.text().strip()
-        if not file_name:
-            file_name = "mydata"
-
-        save_format = self.format_combobox.currentText()  # "CSV" or "H5"
-
-        if not save_dir or not os.path.isdir(save_dir):
-            QtWidgets.QMessageBox.warning(self, "Warning", "Invalid save directory.")
-            return
-
-        n_channels = len(self.plot_times)
-        if n_channels == 0:
-            QtWidgets.QMessageBox.information(self, "Info", "No data to save.")
-            return
-
-        lengths = [len(self.plot_times[ch]) for ch in range(n_channels)]
-        max_len = max(lengths)
-
-        # 代表として一番長い times
-        rep_i = np.argmax(lengths)
-        rep_times = self.plot_times[rep_i]
-        out_times = rep_times.copy()
-        out_data = np.full((n_channels, max_len), np.nan, dtype=np.float64)
-
-        for ch_i in range(n_channels):
-            length_i = len(self.plot_times[ch_i])
-            if length_i == max_len:
-                out_data[ch_i, :] = self.plot_data[ch_i]
-            else:
-                # 小さいほうに合わせる
-                out_data[ch_i, :length_i] = self.plot_data[ch_i]
-
-        file_path = os.path.join(save_dir, file_name)
-        if save_format == "CSV":
-            if not file_path.lower().endswith(".csv"):
-                file_path += ".csv"
-            self.save_csv(file_path, out_times, out_data)
-        else:
-            if not file_path.lower().endswith(".h5"):
-                file_path += ".h5"
-            if not HAS_H5PY:
-                QtWidgets.QMessageBox.warning(self, "Warning", "h5py is not installed.")
-                return
-            self.save_hdf5(file_path, out_times, out_data)
-
-        QtWidgets.QMessageBox.information(self, "Info", f"Data saved to {file_path}")
-
-    def save_csv(self, file_path, times, data):
-        # ヘッダにself.selected_channelsを使用
-        n_channels = len(self.selected_channels)
-        with open(file_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            # 先頭列は "time", その後に選択したチャネル名をそのまま
-            header = ["time"] + list(self.selected_channels)
-            writer.writerow(header)
-
-            max_len = times.size
-            for i in range(max_len):
-                row = [times[i]]
-                for ch_i in range(n_channels):
-                    row.append(data[ch_i, i])
-                writer.writerow(row)
-
-    def save_hdf5(self, file_path, times, data):
-        import h5py
-        n_channels = len(self.selected_channels)
-        with h5py.File(file_path, "w") as f:
-            f.create_dataset("times", data=times, dtype=np.float64)
-            dset = f.create_dataset("data", data=data, dtype=np.float64)
-            # チャネル名の保存
-            # HDF5で文字列リストを保存するには、可変長文字列dtypeを使う方法などがある
-            dt = h5py.special_dtype(vlen=str)
-            f.create_dataset("channel_names", (n_channels,), dt)
-            for i in range(n_channels):
-                f["channel_names"][i] = self.selected_channels[i]
-
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
@@ -404,4 +464,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
